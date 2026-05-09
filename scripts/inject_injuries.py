@@ -142,48 +142,74 @@ def fetch_player_id_map(conn, gsis_ids: set[str]) -> dict[str, str]:
 def upsert_weekly(
     conn, records: list[dict[str, Any]], id_map: dict[str, str], full_names: dict[str, str]
 ) -> tuple[int, int]:
-    matched, unresolved = 0, 0
+    """Bulk-upsert via execute_values. Was per-row; over a 150k-row 2009-2025
+    backfill against Supabase's pooler that meant 150k×~50ms round trips =
+    multi-hour stall. Batches of 1000 cuts that to seconds."""
+    # Dedupe within batch on the conflict-key tuples — Postgres rejects
+    # ON CONFLICT DO UPDATE if the same conflict key appears twice in one
+    # statement. nflverse occasionally lists a player twice in the same
+    # week with different injury notes; "last seen wins" matches the prior
+    # per-row INSERT semantics.
+    matched_by_key: dict[tuple, tuple] = {}
+    unresolved_by_gsis: dict[str, tuple] = {}
+    for r in records:
+        pid = id_map.get(r['gsis_id'])
+        if pid:
+            key = (r['gsis_id'], r['season'], r['week'], r['source'])
+            matched_by_key[key] = (
+                pid, r['gsis_id'], r['season'], r['week'],
+                r['report_status'], r['practice_status'],
+                r['report_primary_injury'], r['report_secondary_injury'],
+                r['team'], r['position'], r['source'], r['source_row_hash'],
+            )
+        else:
+            unresolved_by_gsis[r['gsis_id']] = (
+                r['gsis_id'], full_names.get(r['gsis_id']),
+                r['team'], r['position'],
+            )
+
+    matched_rows = list(matched_by_key.values())
+    unresolved_rows = list(unresolved_by_gsis.values())
+
+    print(f'[inject_injuries] bulk-upserting {len(matched_rows)} matched + {len(unresolved_rows)} unresolved rows')
+
     with conn.cursor() as cur:
-        for r in records:
-            pid = id_map.get(r['gsis_id'])
-            if pid:
-                matched += 1
-                cur.execute(
-                    """INSERT INTO player_injury_status_weekly (
-                         player_id, gsis_id, season, week, report_status, practice_status,
-                         report_primary_injury, report_secondary_injury, team, position,
-                         source, source_row_hash
-                       ) VALUES (
-                         %(pid)s, %(gsis_id)s, %(season)s, %(week)s, %(report_status)s,
-                         %(practice_status)s, %(report_primary_injury)s,
-                         %(report_secondary_injury)s, %(team)s, %(position)s,
-                         %(source)s, %(source_row_hash)s
-                       )
-                       ON CONFLICT (gsis_id, season, week, source) DO UPDATE SET
-                         report_status           = EXCLUDED.report_status,
-                         practice_status         = EXCLUDED.practice_status,
-                         report_primary_injury   = EXCLUDED.report_primary_injury,
-                         report_secondary_injury = EXCLUDED.report_secondary_injury,
-                         source_row_hash         = EXCLUDED.source_row_hash,
-                         ingested_at             = now()
-                       WHERE player_injury_status_weekly.source_row_hash <> EXCLUDED.source_row_hash""",
-                    {**r, 'pid': pid},
-                )
-            else:
-                unresolved += 1
-                cur.execute(
-                    """INSERT INTO sync_unresolved_injury_ids
-                         (gsis_id, full_name, team, position)
-                       VALUES (%(gsis_id)s, %(full_name)s, %(team)s, %(position)s)
-                       ON CONFLICT (gsis_id) DO UPDATE SET
-                         last_seen_at = now(),
-                         seen_count   = sync_unresolved_injury_ids.seen_count + 1,
-                         full_name    = COALESCE(EXCLUDED.full_name, sync_unresolved_injury_ids.full_name),
-                         team         = COALESCE(EXCLUDED.team, sync_unresolved_injury_ids.team),
-                         position     = COALESCE(EXCLUDED.position, sync_unresolved_injury_ids.position)""",
-                    {**r, 'full_name': full_names.get(r['gsis_id'])},
-                )
-    return matched, unresolved
+        if matched_rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """INSERT INTO player_injury_status_weekly (
+                     player_id, gsis_id, season, week, report_status, practice_status,
+                     report_primary_injury, report_secondary_injury, team, position,
+                     source, source_row_hash
+                   ) VALUES %s
+                   ON CONFLICT (gsis_id, season, week, source) DO UPDATE SET
+                     report_status           = EXCLUDED.report_status,
+                     practice_status         = EXCLUDED.practice_status,
+                     report_primary_injury   = EXCLUDED.report_primary_injury,
+                     report_secondary_injury = EXCLUDED.report_secondary_injury,
+                     source_row_hash         = EXCLUDED.source_row_hash,
+                     ingested_at             = now()
+                   WHERE player_injury_status_weekly.source_row_hash <> EXCLUDED.source_row_hash""",
+                matched_rows,
+                page_size=1000,
+            )
+        if unresolved_rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """INSERT INTO sync_unresolved_injury_ids
+                     (gsis_id, full_name, team, position)
+                   VALUES %s
+                   ON CONFLICT (gsis_id) DO UPDATE SET
+                     last_seen_at = now(),
+                     seen_count   = sync_unresolved_injury_ids.seen_count + 1,
+                     full_name    = COALESCE(EXCLUDED.full_name, sync_unresolved_injury_ids.full_name),
+                     team         = COALESCE(EXCLUDED.team, sync_unresolved_injury_ids.team),
+                     position     = COALESCE(EXCLUDED.position, sync_unresolved_injury_ids.position)""",
+                unresolved_rows,
+                page_size=1000,
+            )
+
+    return len(matched_rows), len(unresolved_rows)
 
 
 def main() -> int:
