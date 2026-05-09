@@ -65,16 +65,78 @@ def row_to_record(row: dict[str, Any], source: str) -> dict[str, Any]:
 
 
 def fetch_player_id_map(conn, gsis_ids: set[str]) -> dict[str, str]:
+    """Return {gsis_id: player_uuid} by checking player_external_ids source='gsis'
+    first, then falling back to a cross-ref through sleeper IDs via the nflverse
+    ID mapping table. Populates player_external_ids source='gsis' as a side effect
+    so subsequent calls are fast."""
     if not gsis_ids:
         return {}
+
+    # 1. Direct lookup — already-cached gsis entries.
+    result: dict[str, str] = {}
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT gsis_id, id::text
-                 FROM players
-                WHERE gsis_id = ANY(%s)""",
+            """SELECT source_id, player_id::text
+                 FROM player_external_ids
+                WHERE source = 'gsis'
+                  AND source_id = ANY(%s)""",
             (list(gsis_ids),),
         )
-        return {r[0]: r[1] for r in cur.fetchall()}
+        for row in cur.fetchall():
+            result[row[0]] = row[1]
+
+    missing = gsis_ids - set(result)
+    if not missing:
+        return result
+
+    # 2. Cross-reference: nflverse gsis→sleeper mapping, then look up sleeper rows.
+    try:
+        import nfl_data_py as nfl
+        id_df = nfl.import_ids()
+        # Build gsis→sleeper map for only the missing gsis_ids
+        # sleeper_id comes back as float (e.g. 4046.0) — cast to int string
+        gsis_to_sleeper: dict[str, str] = {}
+        for _, row in id_df.iterrows():
+            g = row.get('gsis_id')
+            s = row.get('sleeper_id')
+            if g and g in missing and s and str(s) != 'nan':
+                gsis_to_sleeper[g] = str(int(float(s)))
+    except Exception as exc:
+        print(f'[inject_injuries] nflverse id mapping failed: {exc}', file=sys.stderr)
+        gsis_to_sleeper = {}
+
+    if gsis_to_sleeper:
+        sleeper_ids = list(gsis_to_sleeper.values())
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT source_id, player_id::text
+                     FROM player_external_ids
+                    WHERE source = 'sleeper'
+                      AND source_id = ANY(%s)""",
+                (sleeper_ids,),
+            )
+            sleeper_to_pid: dict[str, str] = {r[0]: r[1] for r in cur.fetchall()}
+
+        # Populate gsis results and back-fill player_external_ids
+        new_gsis_entries: list[tuple[str, str]] = []
+        for gsis, sleeper in gsis_to_sleeper.items():
+            pid = sleeper_to_pid.get(sleeper)
+            if pid:
+                result[gsis] = pid
+                new_gsis_entries.append((gsis, pid))
+
+        if new_gsis_entries:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO player_external_ids (source, source_id, player_id)
+                       VALUES %s
+                       ON CONFLICT (source, source_id) DO NOTHING""",
+                    [('gsis', g, p) for g, p in new_gsis_entries],
+                )
+            print(f'[inject_injuries] back-filled {len(new_gsis_entries)} gsis entries into player_external_ids')
+
+    return result
 
 
 def upsert_weekly(
