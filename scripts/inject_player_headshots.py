@@ -15,8 +15,13 @@ fetch_player_id_map helper is duplicated rather than shared because there
 are only two callers; extract to a sibling module if a third one shows up.
 
 Usage:
+    .venv/bin/python scripts/inject_player_headshots.py --auto-season
     .venv/bin/python scripts/inject_player_headshots.py --seasons 2024-2026
     .venv/bin/python scripts/inject_player_headshots.py --seasons 2025
+
+`--auto-season` derives a 4-year window ending in the current calendar
+year — preferred for the systemd timer so future seasons roll over
+without manual operator edits.
 
 Env:
     DATABASE_URL   Postgres connection string (sslmode=require ok)
@@ -26,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
@@ -43,6 +49,17 @@ def parse_seasons(arg: str) -> list[int]:
         a, b = arg.split('-', 1)
         return list(range(int(a), int(b) + 1))
     return [int(s) for s in arg.split(',')]
+
+
+def default_seasons(today: datetime | None = None) -> list[int]:
+    """Auto-derived `--seasons` value for the systemd timer. Returns a
+    4-year sliding window ending in today's calendar year, e.g. in 2026 →
+    [2023, 2024, 2025, 2026]. The current year catches newly-drafted
+    rookies once nflverse publishes the post-draft season roster
+    (typically May–July). Past years stay in scope to catch retired vets
+    whose photos arrive later via the injury-news ingest path."""
+    today = today or datetime.now(timezone.utc)
+    return list(range(today.year - 3, today.year + 1))
 
 
 def fetch_player_id_map(conn, gsis_ids: set[str]) -> dict[str, str]:
@@ -152,16 +169,33 @@ def update_photos(conn, photo_rows: list[tuple[str, str]]) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--seasons', default='2024-2026', help='e.g. 2025 or 2024-2026 or 2023,2024')
+    ap.add_argument('--seasons', help='e.g. 2025 or 2024-2026 or 2023,2024')
+    ap.add_argument(
+        '--auto-season',
+        action='store_true',
+        help='Derive a 4-year window ending in today\'s calendar year. '
+             'Preferred for the systemd timer. Mutually exclusive with --seasons.',
+    )
     ap.add_argument('--dry-run', action='store_true', help='resolve IDs but skip the UPDATE')
     args = ap.parse_args()
+
+    if args.seasons and args.auto_season:
+        print('[inject_player_headshots] pass either --seasons or --auto-season, not both', file=sys.stderr)
+        return 2
+    if not args.seasons and not args.auto_season:
+        print('[inject_player_headshots] one of --seasons or --auto-season is required', file=sys.stderr)
+        return 2
 
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
         print('[inject_player_headshots] DATABASE_URL missing', file=sys.stderr)
         return 2
 
-    seasons = parse_seasons(args.seasons)
+    if args.auto_season:
+        seasons = default_seasons()
+        print(f'[inject_player_headshots] auto-season: derived {seasons[0]}-{seasons[-1]}')
+    else:
+        seasons = parse_seasons(args.seasons)
     print(f'[inject_player_headshots] pulling nflverse seasonal rosters for {seasons}')
 
     headshots = collect_headshots(seasons)
