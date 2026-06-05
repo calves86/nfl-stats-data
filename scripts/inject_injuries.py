@@ -44,23 +44,29 @@ def hash_row(row: dict[str, Any], source: str) -> str:
         source, row.get('gsis_id'), row.get('season'), row.get('week'),
         row.get('report_status'), row.get('practice_status'),
         row.get('report_primary_injury'), row.get('report_secondary_injury'),
+        row.get('practice_primary_injury'), row.get('practice_secondary_injury'),
     )
     return hashlib.sha256('|'.join(str(f) for f in fields).encode()).hexdigest()
 
 
 def row_to_record(row: dict[str, Any], source: str) -> dict[str, Any]:
     return {
-        'gsis_id':                 row['gsis_id'],
-        'season':                  int(row['season']),
-        'week':                    int(row['week']),
-        'report_status':           row.get('report_status') or None,
-        'practice_status':         row.get('practice_status') or None,
-        'report_primary_injury':   row.get('report_primary_injury') or None,
-        'report_secondary_injury': row.get('report_secondary_injury') or None,
-        'team':                    row.get('team') or None,
-        'position':                row.get('position') or None,
-        'source':                  source,
-        'source_row_hash':         hash_row(row, source),
+        'gsis_id':                   row['gsis_id'],
+        'season':                    int(row['season']),
+        'week':                      int(row['week']),
+        'report_status':             row.get('report_status') or None,
+        'practice_status':           row.get('practice_status') or None,
+        'report_primary_injury':     row.get('report_primary_injury') or None,
+        'report_secondary_injury':   row.get('report_secondary_injury') or None,
+        # nflverse carries the body part here when a player practiced but got no
+        # game-status designation (report_primary_injury NULL). Without this the
+        # derived body_part defaults to 'undisclosed' for ~36% of rows.
+        'practice_primary_injury':   row.get('practice_primary_injury') or None,
+        'practice_secondary_injury': row.get('practice_secondary_injury') or None,
+        'team':                      row.get('team') or None,
+        'position':                  row.get('position') or None,
+        'source':                    source,
+        'source_row_hash':           hash_row(row, source),
     }
 
 
@@ -160,6 +166,7 @@ def upsert_weekly(
                 pid, r['gsis_id'], r['season'], r['week'],
                 r['report_status'], r['practice_status'],
                 r['report_primary_injury'], r['report_secondary_injury'],
+                r['practice_primary_injury'], r['practice_secondary_injury'],
                 r['team'], r['position'], r['source'], r['source_row_hash'],
             )
         else:
@@ -179,16 +186,19 @@ def upsert_weekly(
                 cur,
                 """INSERT INTO player_injury_status_weekly (
                      player_id, gsis_id, season, week, report_status, practice_status,
-                     report_primary_injury, report_secondary_injury, team, position,
+                     report_primary_injury, report_secondary_injury,
+                     practice_primary_injury, practice_secondary_injury, team, position,
                      source, source_row_hash
                    ) VALUES %s
                    ON CONFLICT (gsis_id, season, week, source) DO UPDATE SET
-                     report_status           = EXCLUDED.report_status,
-                     practice_status         = EXCLUDED.practice_status,
-                     report_primary_injury   = EXCLUDED.report_primary_injury,
-                     report_secondary_injury = EXCLUDED.report_secondary_injury,
-                     source_row_hash         = EXCLUDED.source_row_hash,
-                     ingested_at             = now()
+                     report_status             = EXCLUDED.report_status,
+                     practice_status           = EXCLUDED.practice_status,
+                     report_primary_injury     = EXCLUDED.report_primary_injury,
+                     report_secondary_injury   = EXCLUDED.report_secondary_injury,
+                     practice_primary_injury   = EXCLUDED.practice_primary_injury,
+                     practice_secondary_injury = EXCLUDED.practice_secondary_injury,
+                     source_row_hash           = EXCLUDED.source_row_hash,
+                     ingested_at               = now()
                    WHERE player_injury_status_weekly.source_row_hash <> EXCLUDED.source_row_hash""",
                 matched_rows,
                 page_size=1000,
