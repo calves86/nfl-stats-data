@@ -9,6 +9,8 @@ SAMPLE = {
     'practice_status': 'Limited',
     'report_primary_injury': 'Knee',
     'report_secondary_injury': None,
+    'practice_primary_injury': 'Hamstring',
+    'practice_secondary_injury': None,
 }
 
 class TestRowToRecord(unittest.TestCase):
@@ -21,6 +23,12 @@ class TestRowToRecord(unittest.TestCase):
         self.assertEqual(r['report_primary_injury'], 'Knee')
         self.assertEqual(r['source'], 'nflverse')
 
+    def test_captures_practice_report_injury(self):
+        # The body part for players with no game-status designation lives here.
+        r = row_to_record(SAMPLE, source='nflverse')
+        self.assertEqual(r['practice_primary_injury'], 'Hamstring')
+        self.assertIsNone(r['practice_secondary_injury'])
+
     def test_hash_is_stable(self):
         h1 = hash_row(SAMPLE, source='nflverse')
         h2 = hash_row(dict(SAMPLE), source='nflverse')
@@ -31,12 +39,21 @@ class TestRowToRecord(unittest.TestCase):
         s2 = dict(SAMPLE); s2['report_status'] = 'Out'
         self.assertNotEqual(h1, hash_row(s2, source='nflverse'))
 
+    def test_hash_changes_when_practice_injury_changes(self):
+        # Re-ingest must overwrite existing rows (which were hashed without the
+        # practice fields), so the hash has to fold practice injuries in.
+        h1 = hash_row(SAMPLE, source='nflverse')
+        s2 = dict(SAMPLE); s2['practice_primary_injury'] = 'Ankle'
+        self.assertNotEqual(h1, hash_row(s2, source='nflverse'))
+
     def test_handles_missing_optional_fields(self):
         thin = {'season':2024,'week':5,'team':'PHI','gsis_id':'00-0036389',
                 'full_name':'X','position':'QB'}
         r = row_to_record(thin, source='nflverse')
         self.assertIsNone(r['report_status'])
         self.assertIsNone(r['report_primary_injury'])
+        self.assertIsNone(r['practice_primary_injury'])
+        self.assertIsNone(r['practice_secondary_injury'])
 
 if __name__ == '__main__':
     unittest.main()
