@@ -20,6 +20,8 @@ import hashlib
 import json
 import os
 import sys
+import urllib.error
+from datetime import date
 from typing import Any
 
 import psycopg2
@@ -37,6 +39,62 @@ def parse_seasons(arg: str) -> list[int]:
         a, b = arg.split('-', 1)
         return list(range(int(a), int(b) + 1))
     return [int(s) for s in arg.split(',')]
+
+
+def _is_missing_file_error(exc: Exception) -> bool:
+    """Whether a fetch exception means the season's parquet simply isn't there.
+
+    nflverse creates a season's injuries file on demand at ~Week 1; until then
+    the URL 404s. pandas surfaces that as a urllib HTTPError 404 today, but a
+    different read backend could raise FileNotFoundError or wrap the 404 in
+    another type, so we also match well-anchored 'not found' phrasings. A non-404
+    HTTP error (e.g. a 5xx outage) and generic parse errors (e.g. a truncated
+    parquet's 'magic bytes not found') are deliberately NOT treated as missing,
+    so a genuine in-season data problem still surfaces loudly.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 404
+    if isinstance(exc, FileNotFoundError):
+        return True
+    msg = str(exc).lower()
+    return (
+        'error 404' in msg          # urllib: "HTTP Error 404: Not Found"
+        or '404 client error' in msg  # requests
+        or '404, message' in msg      # aiohttp / fsspec
+        or 'no such file' in msg      # local / fsspec file-not-found text
+    )
+
+
+def fetch_injuries(seasons: list[int], today: date | None = None):
+    """Pull nflverse weekly injuries season-by-season, tolerating a season whose
+    file nflverse has not published yet.
+
+    The scheduled job runs with the current season, whose injuries parquet does
+    not exist until ~Week 1 (early September) — until then the fetch 404s. Before
+    this fix that 404 was uncaught and crashed the job on every timer fire from
+    March until Week 1. Here a 'file not found' for the current (or a future)
+    season is treated as 'nothing to ingest yet' and skipped, so the run exits
+    cleanly for the whole offseason including the Sept-1-to-Week-1 gap. A failure
+    for a PAST season (its file must already exist) or any non-404 error for the
+    current season (a real outage worth seeing) is re-raised so genuine breakage
+    still surfaces. Returns a pandas DataFrame (possibly empty).
+    """
+    import pandas as pd
+
+    current_year = (today or date.today()).year
+    frames = []
+    for season in seasons:
+        try:
+            frames.append(nfl.import_injuries([season]))
+        except Exception as exc:
+            if season >= current_year and _is_missing_file_error(exc):
+                print(f'[inject_injuries] season {season} not published by nflverse yet '
+                      f'({exc}) — nothing to ingest, skipping')
+                continue
+            raise
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def hash_row(row: dict[str, Any], source: str) -> str:
@@ -236,7 +294,7 @@ def main() -> int:
     seasons = parse_seasons(args.seasons)
     print(f'[inject_injuries] pulling nflverse injuries for seasons {seasons}')
 
-    df = nfl.import_injuries(seasons)
+    df = fetch_injuries(seasons)
     if df.empty:
         print('[inject_injuries] no rows from nflverse')
         return 0
