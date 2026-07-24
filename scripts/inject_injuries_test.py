@@ -1,6 +1,13 @@
 from __future__ import annotations
 import unittest
-from inject_injuries import row_to_record, hash_row
+import urllib.error
+from datetime import date
+from unittest import mock
+
+import pandas as pd
+
+import inject_injuries
+from inject_injuries import row_to_record, hash_row, fetch_injuries
 
 SAMPLE = {
     'season': 2024, 'week': 5, 'team': 'PHI',
@@ -54,6 +61,115 @@ class TestRowToRecord(unittest.TestCase):
         self.assertIsNone(r['report_primary_injury'])
         self.assertIsNone(r['practice_primary_injury'])
         self.assertIsNone(r['practice_secondary_injury'])
+
+def _http_error(code, url='https://github.com/nflverse/nflverse-data/releases/download/injuries/injuries_2026.parquet'):
+    return urllib.error.HTTPError(url, code, 'err', {}, None)
+
+
+def _http_404():
+    return _http_error(404)
+
+
+class TestIsMissingFileError(unittest.TestCase):
+    """Only a genuine 'file not found' counts as 'not published yet'; anything
+    else (a 5xx outage, a connection reset) must be treated as a real failure."""
+
+    def test_http_404_is_missing(self):
+        self.assertTrue(inject_injuries._is_missing_file_error(_http_404()))
+
+    def test_http_503_is_not_missing(self):
+        self.assertFalse(inject_injuries._is_missing_file_error(_http_error(503)))
+
+    def test_file_not_found_is_missing(self):
+        self.assertTrue(inject_injuries._is_missing_file_error(FileNotFoundError('injuries_2026.parquet')))
+
+    def test_wrapped_404_message_is_missing(self):
+        # A future pandas/fsspec backend may wrap the 404 in another type.
+        self.assertTrue(inject_injuries._is_missing_file_error(Exception('HTTP Error 404: Not Found')))
+
+    def test_requests_style_404_message_is_missing(self):
+        self.assertTrue(inject_injuries._is_missing_file_error(
+            Exception('404 Client Error: Not Found for url: https://.../injuries_2026.parquet')))
+
+    def test_parse_error_mentioning_not_found_is_not_missing(self):
+        # A truncated/corrupt parquet in-season must surface, not be swallowed.
+        self.assertFalse(inject_injuries._is_missing_file_error(
+            Exception('ArrowInvalid: Parquet magic bytes not found in footer')))
+
+    def test_connection_error_is_not_missing(self):
+        self.assertFalse(inject_injuries._is_missing_file_error(ConnectionError('reset')))
+
+
+class TestFetchInjuries(unittest.TestCase):
+    """The scheduled job must exit cleanly when nflverse hasn't published the
+    current season's file yet — for the WHOLE offseason including the Sept-1 to
+    Week-1 gap — but a failure for a season that should already exist, or a
+    non-404 outage for the current season, must still surface loudly."""
+
+    def test_current_season_404_offseason_returns_empty(self):
+        # July: the actual ongoing production incident — must not crash.
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=_http_404()):
+            df = fetch_injuries([2026], today=date(2026, 7, 24))
+        self.assertTrue(df.empty)
+
+    def test_current_season_404_early_september_returns_empty(self):
+        # Sept 1 -> Week 1 (~Sept 10): file still absent. Regression guard for the
+        # boundary bug the calendar-cutoff version had (crashed this window).
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=_http_404()):
+            df = fetch_injuries([2026], today=date(2026, 9, 3))
+        self.assertTrue(df.empty)
+
+    def test_past_season_404_reraises(self):
+        # A 404 for a season whose file must exist is real breakage.
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=_http_404()):
+            with self.assertRaises(urllib.error.HTTPError):
+                fetch_injuries([2024], today=date(2026, 9, 3))
+
+    def test_current_season_non_404_reraises(self):
+        # An in-season 5xx outage must NOT be swallowed as 'not published'.
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=_http_error(503)):
+            with self.assertRaises(urllib.error.HTTPError):
+                fetch_injuries([2026], today=date(2026, 11, 15))
+
+    def test_current_season_connection_error_reraises(self):
+        # Only 'file not found' is tolerated; a transient network error surfaces.
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=ConnectionError('reset')):
+            with self.assertRaises(ConnectionError):
+                fetch_injuries([2026], today=date(2026, 7, 24))
+
+    def test_future_season_missing_file_returns_empty(self):
+        # Defensive: NFL_CURRENT_SEASON accidentally set ahead of the calendar.
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=FileNotFoundError('injuries_2027.parquet')):
+            df = fetch_injuries([2027], today=date(2026, 7, 24))
+        self.assertTrue(df.empty)
+
+    def test_success_returns_rows(self):
+        frame = pd.DataFrame([SAMPLE])
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', return_value=frame):
+            df = fetch_injuries([2024], today=date(2026, 7, 24))
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]['gsis_id'], '00-0036389')
+
+    def test_backfill_skips_unpublished_keeps_published(self):
+        # Multi-season backfill: 2024/2025 return rows, 2026 404s and is skipped.
+        def side_effect(years):
+            (y,) = years
+            if y == 2026:
+                raise _http_404()
+            return pd.DataFrame([dict(SAMPLE, season=y)])
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=side_effect):
+            df = fetch_injuries([2024, 2025, 2026], today=date(2026, 7, 24))
+        self.assertEqual(sorted(df['season'].tolist()), [2024, 2025])
+
+    def test_each_season_fetched_individually(self):
+        calls = []
+        def side_effect(years):
+            calls.append(list(years))
+            return pd.DataFrame([dict(SAMPLE, season=years[0])])
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=side_effect):
+            fetch_injuries([2023, 2024], today=date(2026, 7, 24))
+        self.assertEqual(calls, [[2023], [2024]])
+
 
 if __name__ == '__main__':
     unittest.main()
