@@ -350,13 +350,25 @@ class TestMainRecordsEveryOutcome(unittest.TestCase):
         # inject_injuries rolls the whole ingest back on error. Sharing that
         # connection would roll the audit row back with it — the failure would
         # erase its own evidence.
-        rc, log_conn = self._run_main(fetch_result=pd.DataFrame([SAMPLE]), upsert=(1, 0))
+        #
+        # ⚠️ This assertion used to be `assertFalse(any('player_injury_status_weekly'
+        # in sql ...))`, which was VACUOUS: _run_main mocks out fetch_player_id_map
+        # and upsert_weekly, so that table never appears in any statement on any
+        # connection and the check passed even with `conn = log_conn`. Assert the
+        # split positively instead — two distinct connections, and nothing but
+        # sync_runs travelling on the audit one.
+        conns = []
+        rc, _ = self._run_main(fetch_result=pd.DataFrame([SAMPLE]), upsert=(1, 0), conns=conns)
         self.assertEqual(rc, 0)
+
+        self.assertEqual(len(conns), 2, 'the ingest must open its own connection')
+        self.assertIsNot(conns[0], conns[1], 'the audit log must not share the ingest connection')
+
+        log_conn = conns[0]
         self.assertTrue(log_conn.autocommit)
-        self.assertFalse(
-            any('player_injury_status_weekly' in c[0] for c in log_conn.calls),
-            'the log connection must not carry ingest writes',
-        )
+        for sql, _params in log_conn.calls:
+            self.assertIn('sync_runs', sql, f'non-audit statement on the log connection: {sql[:80]}')
+        self.assertEqual(log_conn.commits, 0, 'an autocommit connection never needs commit()')
 
 
 if __name__ == '__main__':
