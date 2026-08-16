@@ -34,6 +34,50 @@ except ImportError as e:
     sys.exit(2)
 
 
+# sync_runs step name. Must stay in step with MONITORED_STEPS in
+# commish/backend/scripts/lib/syncHealth.mjs — this is a cross-repo, cross-language
+# literal, so renaming one side alone stops the watchdog silently instead of
+# failing anything. Both sides pin it in a test.
+SYNC_STEP = 'injury_weekly_ingest'
+
+_TERMINAL_STATUSES = ('ok', 'partial', 'failed')
+
+
+def start_sync_run(conn, step: str = SYNC_STEP) -> str:
+    """Open a sync_runs row and return its id.
+
+    Must be on an AUTOCOMMIT connection separate from the ingest transaction:
+    main() rolls the whole ingest back on error, and a shared connection would
+    roll this row back with it — the failure would erase its own evidence. It
+    also has to be visible immediately, because a run killed mid-flight (SIGTERM
+    at TimeoutStartSec, OOM, reboot) never reaches the UPDATE, and health-sync
+    reads that stranded 'running' row as the fingerprint of a kill.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sync_runs (status, step) VALUES ('running', %s) RETURNING id",
+            (step,),
+        )
+        (run_id,) = cur.fetchone()
+    return str(run_id)
+
+
+def finish_sync_run(conn, run_id: str, status: str, notes: str | None = None,
+                    rows_affected: int | None = None) -> None:
+    """Close a sync_runs row out. `status` is CHECK-constrained in the table;
+    rejecting a bad one here beats a constraint violation that would take down
+    the very write we came to make."""
+    if status not in _TERMINAL_STATUSES:
+        raise ValueError(f'status must be one of {_TERMINAL_STATUSES}, got {status!r}')
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE sync_runs
+                  SET status = %s, finished_at = now(), notes = %s, rows_affected = %s
+                WHERE id = %s""",
+            (status, (notes[:2000] if notes else None), rows_affected, run_id),
+        )
+
+
 def parse_seasons(arg: str) -> list[int]:
     if '-' in arg:
         a, b = arg.split('-', 1)
@@ -292,40 +336,65 @@ def main() -> int:
         return 2
 
     seasons = parse_seasons(args.seasons)
-    print(f'[inject_injuries] pulling nflverse injuries for seasons {seasons}')
 
-    df = fetch_injuries(seasons)
-    if df.empty:
-        print('[inject_injuries] no rows from nflverse')
-        return 0
-
-    raw_rows = df.to_dict(orient='records')
-    records = [row_to_record(r, source='nflverse') for r in raw_rows]
-
-    # Carry full_name keyed by gsis_id (for the unresolved audit table)
-    full_names = {r.get('gsis_id'): r.get('full_name') for r in raw_rows if r.get('gsis_id')}
-
-    conn = psycopg2.connect(db_url)
+    # The run log opens BEFORE the nflverse fetch, on its own autocommit
+    # connection. Both details matter: the fetch is the slow part where a
+    # TimeoutStartSec kill lands, and a stranded 'running' row is what tells
+    # health-sync the process was killed rather than merely quiet.
+    log_conn = psycopg2.connect(db_url)
+    log_conn.autocommit = True
+    run_id = start_sync_run(log_conn)
     try:
-        gsis = {r['gsis_id'] for r in records if r.get('gsis_id')}
-        id_map = fetch_player_id_map(conn, gsis)
-        matched, unresolved = upsert_weekly(conn, records, id_map, full_names)
+        print(f'[inject_injuries] pulling nflverse injuries for seasons {seasons}')
 
-        print(f'[inject_injuries] matched={matched} unresolved={unresolved}')
+        df = fetch_injuries(seasons)
+        if df.empty:
+            # Correctly doing nothing — nflverse has not published the season yet
+            # (the whole offseason plus the Sept-1-to-Week-1 gap). This used to
+            # return before anything was recorded, which made a quiet March
+            # indistinguishable from a timer that had stopped firing. Recording
+            # the skip costs one row and makes silence mean exactly one thing.
+            print('[inject_injuries] no rows from nflverse')
+            finish_sync_run(log_conn, run_id, 'ok', rows_affected=0,
+                            notes=f'skipped=no_rows_from_nflverse seasons={seasons}')
+            return 0
 
-        with conn.cursor() as cur:
-            cur.execute('SELECT public.derive_injury_events()')
-            (result,) = cur.fetchone()
-            print(f'[inject_injuries] derive_injury_events → {json.dumps(result)}')
+        raw_rows = df.to_dict(orient='records')
+        records = [row_to_record(r, source='nflverse') for r in raw_rows]
 
-        conn.commit()
-    except Exception:
-        conn.rollback()
+        # Carry full_name keyed by gsis_id (for the unresolved audit table)
+        full_names = {r.get('gsis_id'): r.get('full_name') for r in raw_rows if r.get('gsis_id')}
+
+        conn = psycopg2.connect(db_url)
+        try:
+            gsis = {r['gsis_id'] for r in records if r.get('gsis_id')}
+            id_map = fetch_player_id_map(conn, gsis)
+            matched, unresolved = upsert_weekly(conn, records, id_map, full_names)
+
+            print(f'[inject_injuries] matched={matched} unresolved={unresolved}')
+
+            with conn.cursor() as cur:
+                cur.execute('SELECT public.derive_injury_events()')
+                (result,) = cur.fetchone()
+                print(f'[inject_injuries] derive_injury_events → {json.dumps(result)}')
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        finish_sync_run(log_conn, run_id, 'ok', rows_affected=matched,
+                        notes=f'seasons={seasons} matched={matched} unresolved={unresolved}')
+        return 0
+    except Exception as exc:
+        # Re-raised: a failed ingest must still exit non-zero so systemd records
+        # it. The row just means the watchdog sees the reason too.
+        finish_sync_run(log_conn, run_id, 'failed', notes=f'{type(exc).__name__}: {exc}')
         raise
     finally:
-        conn.close()
-
-    return 0
+        log_conn.close()
 
 
 if __name__ == '__main__':
