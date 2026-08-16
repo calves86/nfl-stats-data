@@ -9,6 +9,7 @@ from unittest import mock
 import pandas as pd
 
 import inject_injuries
+from net_deadline import FetchDeadlineExceeded
 from inject_injuries import (
     row_to_record, hash_row, fetch_injuries,
     SYNC_STEP, start_sync_run, finish_sync_run,
@@ -104,6 +105,14 @@ class TestIsMissingFileError(unittest.TestCase):
     def test_connection_error_is_not_missing(self):
         self.assertFalse(inject_injuries._is_missing_file_error(ConnectionError('reset')))
 
+    def test_fetch_deadline_is_not_missing(self):
+        # A timeout is evidence about US, not about whether nflverse published
+        # the file. Misread as 'missing', the job would report success having
+        # ingested nothing — the exact silent-success failure a deadline is
+        # supposed to eliminate.
+        self.assertFalse(inject_injuries._is_missing_file_error(
+            FetchDeadlineExceeded('nflverse injuries fetch (season 2026) exceeded its 300s deadline')))
+
 
 class TestFetchInjuries(unittest.TestCase):
     """The scheduled job must exit cleanly when nflverse hasn't published the
@@ -135,6 +144,14 @@ class TestFetchInjuries(unittest.TestCase):
         with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=_http_error(503)):
             with self.assertRaises(urllib.error.HTTPError):
                 fetch_injuries([2026], today=date(2026, 11, 15))
+
+    def test_current_season_deadline_reraises(self):
+        # Must surface so main()'s handler closes the sync_runs row as 'failed'
+        # with a real reason, instead of the row being stranded by a SIGTERM.
+        boom = FetchDeadlineExceeded('nflverse injuries fetch (season 2026) exceeded its 300s deadline')
+        with mock.patch.object(inject_injuries.nfl, 'import_injuries', side_effect=boom):
+            with self.assertRaises(FetchDeadlineExceeded):
+                fetch_injuries([2026], today=date(2026, 7, 24))
 
     def test_current_season_connection_error_reraises(self):
         # Only 'file not found' is tolerated; a transient network error surfaces.

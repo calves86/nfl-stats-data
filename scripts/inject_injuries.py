@@ -34,6 +34,12 @@ from typing import Any
 import psycopg2
 import psycopg2.extras
 
+from net_deadline import (
+    FETCH_DEADLINE_SECONDS,
+    fetch_deadline,
+    install_socket_default_timeout,
+)
+
 try:
     import nfl_data_py as nfl
 except ImportError as e:
@@ -136,7 +142,11 @@ def fetch_injuries(seasons: list[int], today: date | None = None):
     frames = []
     for season in seasons:
         try:
-            frames.append(nfl.import_injuries([season]))
+            # Bounded: nfl_data_py takes no timeout, and an unbounded hang here
+            # is what gets the process SIGTERM'd at TimeoutStartSec, stranding
+            # the sync_runs row this job opened before the fetch.
+            with fetch_deadline(FETCH_DEADLINE_SECONDS, f'nflverse injuries fetch (season {season})'):
+                frames.append(nfl.import_injuries([season]))
         except Exception as exc:
             if season >= current_year and _is_missing_file_error(exc):
                 print(f'[inject_injuries] season {season} not published by nflverse yet '
@@ -207,7 +217,8 @@ def fetch_player_id_map(conn, gsis_ids: set[str]) -> dict[str, str]:
     # 2. Cross-reference: nflverse gsis→sleeper mapping, then look up sleeper rows.
     try:
         import nfl_data_py as nfl
-        id_df = nfl.import_ids()
+        with fetch_deadline(FETCH_DEADLINE_SECONDS, 'nflverse import_ids fetch'):
+            id_df = nfl.import_ids()
         # Build gsis→sleeper map for only the missing gsis_ids
         # sleeper_id comes back as float (e.g. 4046.0) — cast to int string
         gsis_to_sleeper: dict[str, str] = {}
@@ -343,6 +354,10 @@ def main() -> int:
         return 2
 
     seasons = parse_seasons(args.seasons)
+
+    # Defence in depth for the transports where a socket default applies. The
+    # wall-clock guard around each fetch is the real bound.
+    install_socket_default_timeout()
 
     # The run log opens BEFORE the nflverse fetch, on its own autocommit
     # connection. Both details matter: the fetch is the slow part where a
