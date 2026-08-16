@@ -3,8 +3,15 @@
 inject_injuries.py — pull nflverse weekly NFL injuries and load Postgres.
 
 Inserts rows into public.player_injury_status_weekly, then runs
-public.derive_injury_events() to refresh the events table. Unmatched
-gsis_ids land in public.sync_unresolved_injury_ids for review.
+public.derive_injury_events() to refresh the events table, then
+public.derive_injuries_from_reserve() to restore the severities that the
+report structurally cannot see. Unmatched gsis_ids land in
+public.sync_unresolved_injury_ids for review.
+
+The second derivation is NOT optional: derive_injury_events() overwrites
+severity from the injury report on every run, and the report goes blank the
+moment a player is placed on injured reserve. Dropping that call silently
+returns player_injuries to zero season-ending injuries.
 
 Usage:
     .venv/bin/python scripts/inject_injuries.py --seasons 2024
@@ -377,6 +384,29 @@ def main() -> int:
                 cur.execute('SELECT public.derive_injury_events()')
                 (result,) = cur.fetchone()
                 print(f'[inject_injuries] derive_injury_events → {json.dumps(result)}')
+
+                # ORDER IS LOAD-BEARING, and this call is not optional.
+                #
+                # derive_injury_events() rebuilds player_injuries from the weekly
+                # injury report, and its upsert sets `severity = EXCLUDED.severity`
+                # unconditionally. The report cannot see injured reserve at all — a
+                # player placed on IR leaves the active roster and stops appearing
+                # in it — so every run above pushes a real severity 5 back down to
+                # whatever the report last said, usually 1.
+                #
+                # derive_injuries_from_reserve() restores it from
+                # player_reserve_weeks, merging into the same rows. It must run
+                # after EVERY derive, not merely after the roster ingest: the
+                # roster step lives in commish's sync-players-weekly (Tue + Sat)
+                # while this job runs five days a week, so pairing them there would
+                # leave severity 5 destroyed for most of the week.
+                #
+                # It reads player_reserve_weeks, which is populated independently,
+                # so running it here is correct even when no new roster data has
+                # landed. Cheap and idempotent by construction.
+                cur.execute('SELECT public.derive_injuries_from_reserve()')
+                (reserve_result,) = cur.fetchone()
+                print(f'[inject_injuries] derive_injuries_from_reserve → {json.dumps(reserve_result)}')
 
             conn.commit()
         except Exception:
