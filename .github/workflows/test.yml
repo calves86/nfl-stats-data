@@ -1,0 +1,62 @@
+name: tests
+
+# This repo writes to PRODUCTION on a systemd timer five times a week
+# (injury-weekly-ingest.service runs scripts/inject_injuries.py), and until now
+# nothing ran its tests automatically. Keep this green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: this workflow never needs to write to the repo, and no step
+# interpolates untrusted event data into a shell.
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: scripts unittest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # The suite must never reach a real database. It patches psycopg2.connect
+      # and supplies its own fake DSN, but an inherited DATABASE_URL would point
+      # at PROD — so make its absence explicit rather than assumed.
+      DATABASE_URL: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the VPS venv (Python 3.13.7). CI on a different minor would
+          # not answer the question this repo actually cares about.
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show resolved versions
+        # Printed so a failure caused by a dependency bump is obvious from the
+        # log alone, without reproducing it locally first.
+        run: pip list
+
+      - name: Run tests
+        # Discovery runs from scripts/ because the modules import each other by
+        # bare name (`from net_deadline import ...`) — which is exactly how the
+        # systemd unit invokes them: WorkingDirectory at the repo root, ExecStart
+        # at scripts/inject_injuries.py. Running them any other way would test an
+        # import path production never uses.
+        working-directory: scripts
+        run: python -m unittest discover -p "*_test.py" --verbose

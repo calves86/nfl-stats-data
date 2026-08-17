@@ -1,0 +1,10 @@
+# The VPS venv lives at .venv/ inside this repo, and it was NOT ignored — so a
+# stray `git add -A` (or a `git stash -u`, which is how this bit me) would sweep
+# a multi-hundred-megabyte virtualenv into the history.
+.venv/
+.venv-*/
+venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/

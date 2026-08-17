@@ -1,0 +1,21 @@
+# Runtime dependencies for scripts/.
+#
+# ⚠️ These versions MIRROR THE VPS VENV at /opt/fantasy-app/nfl-stats-data/.venv
+# (read 2026-08-16). CI exists to answer "would this break the box?", so it is
+# only worth anything while the two agree — if you upgrade one, upgrade the
+# other. Check the box with:
+#     ssh root@187.124.249.1 '/opt/fantasy-app/nfl-stats-data/.venv/bin/pip list'
+#
+# Only the packages the scripts import directly are pinned; transitives (numpy,
+# fastparquet, appdirs, ...) resolve from these.
+
+# nflverse data access. Note it exposes NO request timeout — that is why
+# scripts/net_deadline.py wraps its calls in a wall-clock guard.
+nfl_data_py==0.3.2
+
+# Imported directly by inject_injuries.fetch_injuries and by the tests.
+pandas==3.0.2
+
+# Postgres driver. The tests never open a real connection (they patch
+# psycopg2.connect), but the module-level import must still resolve.
+psycopg2-binary==2.9.12
